@@ -167,9 +167,13 @@ class ResidualSolver:
 
                 # 非线性拼接：线性 / sin / 联合 三种 OMP 变体取最优
                 sin_patch = np.sin(patch_y)
+                tanh_patch = np.tanh(patch_y)
+                mix_sin_x = patch_y * np.sin(self.x_test)
                 variants = [
                     ([patch_y], [(candidate_tree, 'raw')], 'lin'),
                     ([sin_patch], [(candidate_tree, 'sin')], 'sin'),
+                    ([tanh_patch], [(candidate_tree, 'tanh')], 'tanh'),
+                    ([mix_sin_x], [(candidate_tree, 'mul_sin_x')], 'mul_sin_x'),
                     ([patch_y, sin_patch], [(candidate_tree, 'raw'), (candidate_tree, 'sin')], 'lin+sin'),
                 ]
                 test_mse = float('inf')
@@ -239,7 +243,14 @@ class ResidualSolver:
             formula_parts = []
             for weight, entry in zip(w_final, active_trees):
                 base_str, mode = self._entry_label(entry)
-                term_str = f"sin({base_str})" if mode == 'sin' else base_str
+                if mode == 'sin':
+                    term_str = f"sin({base_str})"
+                elif mode == 'tanh':
+                    term_str = f"tanh({base_str})"
+                elif mode == 'mul_sin_x':
+                    term_str = f"({base_str})*sin(x)"
+                else:
+                    term_str = base_str
                 if abs(weight) > 0.01:
                     formula_parts.append(f"{weight:.4f} * {term_str}")
                 else:
