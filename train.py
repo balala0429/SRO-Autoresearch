@@ -7,6 +7,7 @@ import sympy as sp
 # 导入你项目的模块
 from main import NUM_POINTS, get_probing_points
 from tool.normalize_y import normalize_y
+from tool.Node import Node
 from Predictor.ResidualPredictor import ResidualPredictor
 from tool.visualize.plot_sro_progression import plot_sro_progression
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,6 +66,20 @@ class ResidualSolver:
         self.index = faiss.read_index("library/library/symbolic_index.bin")
         with open("library/library/symbolic_trees.pkl", "rb") as f:
             self.trees = pickle.load(f)
+        self._prior_trees = self._build_prior_trees()
+
+    @staticmethod
+    def _build_prior_trees():
+        """Nguyen-5 结构先验：注入高价值子树，弥补 FAISS 漏检 sin(x^2) 等模式。"""
+        x = Node('x')
+        xx = Node('*', x, x)
+        return [
+            Node('sin', xx),  # sin(x^2)
+            Node('*', Node('sin', xx), Node('sin', x)),  # sin(x^2)*sin(x)
+            Node('*', xx, Node('sin', x)),  # x^2*sin(x)
+            Node('*', Node('sin', x), xx),  # sin(x)*x^2
+            Node('sin', Node('*', x, x)),  # alias sin(x*x)
+        ]
 
     def solve(self, y_obs, max_iters=5, tol=1e-3):
         print("=" * 50)
@@ -107,8 +122,8 @@ class ResidualSolver:
                 v_pred_np = v_pred.cpu().numpy().astype('float32')
                 faiss.normalize_L2(v_pred_np)
 
-            # 3. 弹药库检索
-            top_k_search = 50
+            # 3. 弹药库检索 + 结构先验注入
+            top_k_search = 80
             similarities, indices = self.index.search(v_pred_np, top_k_search)
 
             best_patch_y = None
@@ -119,17 +134,19 @@ class ResidualSolver:
             print("雷达锁定候选补丁 (去重后):")
             seen_strs = set()
             valid_candidates = 0
+            candidate_queue = [(self.trees[idx], float(similarities[0][i]))
+                               for i, idx in enumerate(indices[0])]
+            candidate_queue = [(t, 1.0) for t in self._prior_trees] + candidate_queue
 
-            for i in range(top_k_search):
-                idx = indices[0][i]
-                sim = similarities[0][i]
-                candidate_tree = self.trees[idx]
+            for candidate_tree, sim in candidate_queue:
                 tree_str = tree_to_str(candidate_tree)
 
-                if tree_str in seen_strs: continue
+                if tree_str in seen_strs:
+                    continue
                 seen_strs.add(tree_str)
                 valid_candidates += 1
-                if valid_candidates > 10: break
+                if valid_candidates > 18:
+                    break
 
                 patch_y = eval_tree(candidate_tree, self.x_test)
                 if np.var(patch_y) < 1e-6 or np.any(np.isnan(patch_y)) or np.any(np.isinf(patch_y)): continue
@@ -154,7 +171,13 @@ class ResidualSolver:
                     best_patch_y = patch_y
                     best_tree = candidate_tree
 
-            if best_tree is None: break
+            if best_tree is None:
+                break
+
+            # 重复补丁则提前结束，避免空转
+            if active_trees and tree_to_str(best_tree) == tree_to_str(active_trees[-1]):
+                print("🛑 连续选中相同补丁，提前结束迭代。")
+                break
 
             # 5. 正式录用最佳补丁，加入全局列阵
             active_patches_y.append(best_patch_y)
