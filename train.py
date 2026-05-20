@@ -292,4 +292,4 @@ if __name__ == "__main__":
 
     print("\n>>> ⚔️ 开始挑战最终 BOSS: Nguyen-5 <<<")
     # 因为它没有 cos，必须用多个组件拼凑，所以我们把最大迭代次数 (max_iters) 放宽到 10 轮
-    solver.solve(y_obs=y_obs, max_iters=10, tol=5e-3)
+    solver.solve(y_obs=y_obs, max_iters=15, tol=1e-3)
