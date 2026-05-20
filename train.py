@@ -81,6 +81,18 @@ class ResidualSolver:
             Node('sin', Node('*', x, x)),  # alias sin(x*x)
         ]
 
+    def _omp_mse(self, columns, y_obs):
+        if not columns:
+            return np.mean(y_obs ** 2)
+        A = np.column_stack(columns)
+        w, _, _, _ = np.linalg.lstsq(A, y_obs, rcond=None)
+        return np.mean((y_obs - A @ w) ** 2)
+
+    def _entry_label(self, entry):
+        if isinstance(entry, tuple):
+            return tree_to_str(entry[0]), entry[1]
+        return tree_to_str(entry), 'raw'
+
     def solve(self, y_obs, max_iters=5, tol=1e-3):
         print("=" * 50)
         print("🚀 开始自动驾驶符号回归 (SRO 推理) - 启用全局重拟合(OMP)")
@@ -126,13 +138,14 @@ class ResidualSolver:
             top_k_search = 80
             similarities, indices = self.index.search(v_pred_np, top_k_search)
 
-            best_patch_y = None
+            best_patch_cols = None
+            best_patch_entries = None
             best_tree = None
             best_score = float('inf')
 
             # 4. Beam Search + 多样性去重 + 全局重拟合评估
             print("雷达锁定候选补丁 (去重后):")
-            seen_strs = set()
+            seen_strs = {self._entry_label(t)[0] for t in active_trees}
             valid_candidates = 0
             candidate_queue = [(self.trees[idx], float(similarities[0][i]))
                                for i, idx in enumerate(indices[0])]
@@ -149,15 +162,28 @@ class ResidualSolver:
                     break
 
                 patch_y = eval_tree(candidate_tree, self.x_test)
-                if np.var(patch_y) < 1e-6 or np.any(np.isnan(patch_y)) or np.any(np.isinf(patch_y)): continue
+                if np.var(patch_y) < 1e-6 or np.any(np.isnan(patch_y)) or np.any(np.isinf(patch_y)):
+                    continue
 
-                # 【核心修改：测试全局重拟合的 MSE】
-                # 把当前的候选组件，加上之前所有的组件，一起做回归！
-                #TODO 这里要加入更多的拼接算子，加入神经网路的激活函数进行拼接可以吗
-                A_test = np.column_stack(active_patches_y + [patch_y])
-                w_test, _, _, _ = np.linalg.lstsq(A_test, y_obs, rcond=None)
-                y_pred_test = A_test @ w_test
-                test_mse = np.mean((y_obs - y_pred_test) ** 2)
+                # 非线性拼接：线性 / sin / 联合 三种 OMP 变体取最优
+                sin_patch = np.sin(patch_y)
+                variants = [
+                    ([patch_y], [(candidate_tree, 'raw')], 'lin'),
+                    ([sin_patch], [(candidate_tree, 'sin')], 'sin'),
+                    ([patch_y, sin_patch], [(candidate_tree, 'raw'), (candidate_tree, 'sin')], 'lin+sin'),
+                ]
+                test_mse = float('inf')
+                best_variant = None
+                for cols, entries, _tag in variants:
+                    if any(np.any(np.isnan(c)) or np.any(np.isinf(c)) for c in cols):
+                        continue
+                    mse = self._omp_mse(active_patches_y + cols, y_obs)
+                    if mse < test_mse:
+                        test_mse = mse
+                        best_variant = (cols, entries)
+
+                if best_variant is None:
+                    continue
 
                 complexity = get_tree_size(candidate_tree)
                 penalty_weight = 0.05
@@ -168,31 +194,29 @@ class ResidualSolver:
 
                 if adjusted_score < best_score:
                     best_score = adjusted_score
-                    best_patch_y = patch_y
+                    best_patch_cols, best_patch_entries = best_variant
                     best_tree = candidate_tree
 
             if best_tree is None:
                 break
 
-            # 重复补丁则提前结束，避免空转
-            if active_trees and tree_to_str(best_tree) == tree_to_str(active_trees[-1]):
-                print("🛑 连续选中相同补丁，提前结束迭代。")
-                break
-
-            # 5. 正式录用最佳补丁，加入全局列阵
-            active_patches_y.append(best_patch_y)
-            active_trees.append(best_tree)
+            # 5. 正式录用最佳补丁（可含 sin 等非线性列），加入全局列阵
+            for col, entry in zip(best_patch_cols, best_patch_entries):
+                active_patches_y.append(col)
+                active_trees.append(entry)
 
             # 算一下新阵列的实时系数，仅用于打印展示
             A_new = np.column_stack(active_patches_y)
             w_new, _, _, _ = np.linalg.lstsq(A_new, y_obs, rcond=None)
             print(f"🎯 选定补丁: [{tree_to_str(best_tree)}]。全局系数重整中...")
 
-            # 熔断机制：如果最新加入的组件，被全局重拟合分配的系数极小，说明它是废件
-            if abs(w_new[-1]) < 1e-4:
+            # 熔断机制：新加入列的系数均趋零则视为收敛
+            n_new = len(best_patch_cols)
+            if all(abs(w) < 1e-4 for w in w_new[-n_new:]):
                 print(f"🛑 熔断触发！新组件在全局回归中权重趋零，模型收敛。")
-                active_patches_y.pop()
-                active_trees.pop()
+                for _ in range(n_new):
+                    active_patches_y.pop()
+                    active_trees.pop()
                 break
 
                 # 【新增：记录本轮战况供画图使用】
@@ -200,7 +224,7 @@ class ResidualSolver:
             current_res = y_obs - current_pred
             self.fit_history.append({
                 'step': step,
-                'patch': tree_to_str(best_tree),  # 记录找出的算子长啥样
+                'patch': tree_to_str(best_tree),
                 'y_pred': current_pred,  # OMP 优化后的最新曲线
                 'res': current_res,  # 最新的残差
                 'mse': np.mean(current_res ** 2)
@@ -213,12 +237,13 @@ class ResidualSolver:
             w_final, _, _, _ = np.linalg.lstsq(A_final, y_obs, rcond=None)
 
             formula_parts = []
-            for weight, tree in zip(w_final, active_trees):
-                # 【核心修剪】：直接扔掉系数小于 0.01 的微小噪声项！
+            for weight, entry in zip(w_final, active_trees):
+                base_str, mode = self._entry_label(entry)
+                term_str = f"sin({base_str})" if mode == 'sin' else base_str
                 if abs(weight) > 0.01:
-                    formula_parts.append(f"{weight:.4f} * {tree_to_str(tree)}")
+                    formula_parts.append(f"{weight:.4f} * {term_str}")
                 else:
-                    print(f"🗑️ 剪枝丢弃微小噪声: {weight:.4f} * {tree_to_str(tree)}")
+                    print(f"🗑️ 剪枝丢弃微小噪声: {weight:.4f} * {term_str}")
 
             if not formula_parts:
                 formula_parts.append("0")
