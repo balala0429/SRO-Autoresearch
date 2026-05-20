@@ -135,7 +135,7 @@ class ResidualSolver:
                 faiss.normalize_L2(v_pred_np)
 
             # 3. 弹药库检索 + 结构先验注入
-            top_k_search = 80
+            top_k_search = 120
             similarities, indices = self.index.search(v_pred_np, top_k_search)
 
             best_patch_cols = None
@@ -158,7 +158,7 @@ class ResidualSolver:
                     continue
                 seen_strs.add(tree_str)
                 valid_candidates += 1
-                if valid_candidates > 18:
+                if valid_candidates > 25:
                     break
 
                 patch_y = eval_tree(candidate_tree, self.x_test)
