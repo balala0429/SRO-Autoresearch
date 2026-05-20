@@ -168,11 +168,13 @@ class ResidualSolver:
                 # 非线性拼接：线性 / sin / 联合 三种 OMP 变体取最优
                 sin_patch = np.sin(patch_y)
                 tanh_patch = np.tanh(patch_y)
+                relu_patch = np.maximum(patch_y, 0.0)
                 mix_sin_x = patch_y * np.sin(self.x_test)
                 variants = [
                     ([patch_y], [(candidate_tree, 'raw')], 'lin'),
                     ([sin_patch], [(candidate_tree, 'sin')], 'sin'),
                     ([tanh_patch], [(candidate_tree, 'tanh')], 'tanh'),
+                    ([relu_patch], [(candidate_tree, 'relu')], 'relu'),
                     ([mix_sin_x], [(candidate_tree, 'mul_sin_x')], 'mul_sin_x'),
                     ([patch_y, sin_patch], [(candidate_tree, 'raw'), (candidate_tree, 'sin')], 'lin+sin'),
                 ]
@@ -247,6 +249,8 @@ class ResidualSolver:
                     term_str = f"sin({base_str})"
                 elif mode == 'tanh':
                     term_str = f"tanh({base_str})"
+                elif mode == 'relu':
+                    term_str = f"relu({base_str})"
                 elif mode == 'mul_sin_x':
                     term_str = f"({base_str})*sin(x)"
                 else:
@@ -292,4 +296,4 @@ if __name__ == "__main__":
 
     print("\n>>> ⚔️ 开始挑战最终 BOSS: Nguyen-5 <<<")
     # 因为它没有 cos，必须用多个组件拼凑，所以我们把最大迭代次数 (max_iters) 放宽到 10 轮
-    solver.solve(y_obs=y_obs, max_iters=15, tol=1e-3)
+    solver.solve(y_obs=y_obs, max_iters=20, tol=5e-4)
