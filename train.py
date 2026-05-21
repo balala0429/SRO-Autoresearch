@@ -465,6 +465,7 @@ def run_nguyen_benchmark(solver, benchmarks=None, plot_last=False, verbose_per_c
         print(f"  [{mark}] {c['name']}: MSE={c['mse']:.6f}")
     print(f"最终综合 MSE: {avg_mse:.6f}")
     print(f"成功求解数: {n_success}/{n_total}")
+    print(f"最终 MSE: {avg_mse:.6f}")
     print("=" * 60)
 
     return avg_mse, n_success, n_total, per_case
