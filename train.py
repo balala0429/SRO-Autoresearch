@@ -105,7 +105,7 @@ PROFILE_CONFIG = {
         "penalty_weight": 0.02,
         "max_iters": 12,
         "tol": 1e-4,
-        "splice_modes": ("raw", "sin"),
+        "splice_modes": ("raw", "sin", "lin+sin"),
     },
     "trig": {
         "top_k": 120,
@@ -159,7 +159,10 @@ class ResidualSolver:
         xx = Node('*', x, x)
         xxx = Node('*', xx, x)
         if profile == "poly":
-            return [x, xx, xxx, Node('*', xxx, x)]
+            x4 = Node('*', xxx, x)
+            x5 = Node('*', x4, x)
+            x6 = Node('*', x5, x)
+            return [x, xx, xxx, x4, x5, x6]
         if profile == "trig":
             return [
                 Node('sin', x),
@@ -469,4 +472,4 @@ def run_nguyen_benchmark(solver, benchmarks=None, plot_last=False, verbose_per_c
 
 if __name__ == "__main__":
     solver = ResidualSolver()
-    run_nguyen_benchmark(solver, plot_last=False, verbose_per_case=True)
+    run_nguyen_benchmark(solver, plot_last=False, verbose_per_case=False)
