@@ -14,12 +14,13 @@ def solve_residual(y_real, x_points, library, predictor):
         residual = y_real - current_f_x
         if np.linalg.norm(residual) < 1e-3: break
 
-        # 1. 探测：Predictor 给出目标向量
-        res_input = torch.tensor(normalize_y(residual)).float()
-        v_target = predictor(res_input.view(1, -1))
+        # 1. 探测：Predictor 给出目标向量（与 predictor 同设备，避免 CPU/GPU 不匹配）
+        device = next(predictor.parameters()).device
+        res_input = torch.tensor(normalize_y(residual)).float().view(1, -1).to(device)
+        v_target = predictor(res_input)
 
         # 2. 检索：从 FAISS 库找补丁
-        candidate_trees, scores = library.search(v_target.detach().numpy(), k=1)
+        candidate_trees, scores = library.search(v_target.detach().cpu().numpy(), k=1)
         patch_tree = candidate_trees[0]
 
         # 3. 拟合系数：最小二乘法求 alpha (residual = alpha * patch_tree(x))
@@ -29,3 +30,5 @@ def solve_residual(y_real, x_points, library, predictor):
         # 4. 更新公式
         print(f"Step {i}: 发现补丁组件 {alpha:.4f} * {patch_tree}")
         current_f_x += alpha * y_patch
+
+    return current_f_x

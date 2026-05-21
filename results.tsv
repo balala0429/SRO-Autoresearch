@@ -18,3 +18,4 @@ e6b52fa	0.000006	discard	predictor centered-residual boost
 b2630a9	0.000006	discard	tol=5e-5 (same MSE)
 f01dd29	0.000053	discard	ResidualPredictor output LayerNorm
 edeaa46	0.000153	discard	squared patch splice
+9ff18b5	0.000020	discard	log profile boost (same avg)
