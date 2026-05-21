@@ -1,0 +1,20 @@
+commit	mse	status	description
+0b868ed	0.214506	keep	baseline (unmodified train.py)
+77c10aa	0.187985	keep	inject sin(x^2) priors + widen beam + dup-stop
+45ade21	0.004517	keep	nonlinear OMP: raw/sin/lin+sin splice
+c856ff4	0.003668	keep	tanh + patch*sin(x) nonlinear splice
+4bd7896	0.003668	discard	post-prune refit (no MSE gain)
+75525e7	0.004457	discard	lower complexity penalty 0.05->0.01
+2bd4ae6	0.000623	keep	max_iters=15 tol=1e-3
+466aafa	0.000469	keep	ReLU splice + max_iters=20 tol=5e-4
+f28b3c2	0.000489	discard	patch*cos(x) splice
+4d99124	0.000457	keep	FAISS k=120 beam 25
+94eb7eb	0.000006	keep	max_iters=25 tol=1e-4
+916e72c	0.000007	discard	triple splice + tol 1e-5
+18d8ca1	0.000099	discard	dynamic subtree injection
+c327a0c	0.000006	discard	max_iters=30 (same MSE)
+7c554d4	0.000010	discard	dual FAISS raw+neural retrieval
+e6b52fa	0.000006	discard	predictor centered-residual boost
+b2630a9	0.000006	discard	tol=5e-5 (same MSE)
+f01dd29	0.000053	discard	ResidualPredictor output LayerNorm
+edeaa46	0.000153	discard	squared patch splice
