@@ -8,6 +8,7 @@ import random
 from main import NUM_POINTS, get_probing_points
 from tool.Node import generate_safe_tree
 from tool.OP_TO_ID import OP_TO_ID
+from tool.tree_utils import is_valid_tree
 from tool.SymbolicAutoencoder import SymbolicAutoencoder
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,7 +42,9 @@ def build_faiss_library(num_samples=50000, max_depth=3):
         tree, y_raw = generate_safe_tree(depth=current_depth, x_samples=x_test)
 
         # 严格过滤无效树 (保证库里的弹药都是好用的)
-        if tree is None or np.any(np.isnan(y_raw)) or np.any(np.isinf(y_raw)):
+        if tree is None or not is_valid_tree(tree):
+            continue
+        if np.any(np.isnan(y_raw)) or np.any(np.isinf(y_raw)):
             continue
         if np.max(np.abs(y_raw)) > 1e5 or np.var(y_raw) < 1e-6:
             continue

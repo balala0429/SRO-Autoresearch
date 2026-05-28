@@ -26,6 +26,16 @@ $$
 
 并在每轮通过 predictor 输出的潜向量查询 FAISS，得到 top-$k$ 候选组件。
 
+### 3.2.1 Operator Integrity Check (结构完整性)
+
+实际运行中发现，若库中存在结构不完整的表达式树（例如二元算子缺少左右子树），数值求值可能“默认为 0”而仍可参与拟合，但字符串化与符号化简会出现非法形式（例如 `(cos(sqrt(x)) + )`）。为保证模型可读性与拼接正确性，本文在**库构建**与**在线加载**阶段加入结构完整性校验（operator integrity check）：
+
+- **叶子节点**：`x`, `y`, `const` 必须无子树；`const` 需有有限实数值。
+- **一元算子**：$\{\sin,\cos,\exp,\log,\sqrt\}$ 必须且仅有一个子树。
+- **二元算子**：$\{+,-,\times,/,\mathrm{pow}\}$ 必须同时具有左右子树。
+
+在线阶段加载 `trees.pkl` 后，会过滤掉不合法树，并重建与过滤后树集合一一对应的 FAISS 索引（确保 `index[i]` 与 `trees[i]` 始终对齐），从而避免检索返回的候选在拼接与打印阶段产生结构缺失。
+
 ## 3.3 Residual Retrieval
 
 ResidualSolver 由三步构成：探测（predictor）、检索（FAISS）与候选评估（beam + 全局重拟合）。
@@ -64,7 +74,12 @@ $$
 \mathrm{score}(T)=\mathrm{MSE}(T)\cdot\left(1+\lambda\cdot\mathrm{size}(T)\right).
 $$
 
-在 beam 层面，对 top-$k$ 候选做去重与截断，仅保留前若干个多样性候选用于评估；最小 score 的候选被加入 active 集合，并在下一轮进行全局重拟合更新。
+在 beam 层面，对 top-$k$ 候选做去重与截断，仅保留前若干个多样性候选用于评估；随后进行**MSE 优先 + 复杂度打破平局（tie-break）**的选择策略：
+
+- 首先选择使 $\mathrm{MSE}(T)$ 最小的候选；
+- 若若干候选的 MSE 差距在阈值 $\rho$ 内（例如相对差距 $\le \rho$），则在这些“近似同精度”的候选中选择复杂度更小者（树节点更少、拼接列数更少）。
+
+该策略的目的，是避免“为了简洁而牺牲达到成功阈值的精度”，同时仍能在精度接近时偏好更短、更可解释的表达式。
 
 ## 3.4 Nonlinear Splicing
 
@@ -77,6 +92,7 @@ $$
 - **tanh**：$\tanh(\phi(T))$
 - **relu**：$\max(\phi(T),0)$
 - **mul\_sin\_x**：$\phi(T)\cdot \sin(x)$
+- **mul\_sin\_y**（2D）：$\phi(T)\cdot \sin(y)$
 - **exp\_mix**：$\exp(\phi(T))$（数值裁剪）
 - **lin+sin**：对联合列集合 $\left[\phi(T),\sin(\phi(T))\right]$ 进行联合最小二乘评估
 
@@ -89,10 +105,7 @@ $$
 为支持 Nguyen-9~12 的二维目标函数，系统对表达式树求值与采样点构造进行了多变量扩展：
 
 1. **统一求值接口**：`eval_tree` 接收变量字典 `var_data={'x':..., 'y':...}`，递归计算树上 `x`、`y` 叶子与一元/二元算子的组合响应。
-2. **采样点构造**：对于 dim=2 的任务，在各自区间上生成同长度的离散点集：
-   - $\{x_i\}_{i=1}^{N}$ 来自 `x_range`
-   - $\{y_i\}_{i=1}^{N}$ 来自 `y_range`
-   并以 $(x_i,y_i)$ 的配对方式构造响应向量（当前实现为“同索引配对”的向量化求值方式）。
+2. **采样点构造**：对于 dim=2 的任务，在 `x_range` 与 `y_range` 上分别取离散点集 $\{x_i\}_{i=1}^{n_x}$ 与 $\{y_j\}_{j=1}^{n_y}$，并构造二维网格 $\{(x_i,y_j)\}$。实际实现采用 `meshgrid` 形成 $n_x\times n_y$ 个点，再按行/列展平为长度 $N=n_x n_y$ 的向量，从而将二维函数评估为统一的一维响应列 $\mathbf{y}\in\mathbb{R}^{N}$。
 3. **变量集合支持**：树表达式的叶子节点扩展为 `x` 与 `y`，并在 structural priors 与拼接策略中包含与二维结构相关的候选子树（例如包含 `sin(y)`、`cos(y)` 与 `sin(x)*cos(y)`）。
 
 在该扩展下，系统可以直接对 Nguyen-9~12 进行与 1D 基准一致的求解与评估流程。
@@ -126,13 +139,13 @@ $$
 
 系统对不同任务族启用不同的 profile 超参数（`PROFILE_CONFIG`），如下：
 
-| profile | top_k | beam_limit | penalty_weight $\lambda$ | max_iters | tol | splice_modes |
-|---|---:|---:|---:|---:|---:|---|
-| `poly` | 80  | 18 | 0.02 | 12 | 1e-4 | (raw, sin, lin+sin) |
-| `trig` | 120 | 25 | 0.05 | 25 | 1e-4 | (raw, sin, tanh, relu, mul_sin_x, lin+sin) |
-| `log` | 100 | 22 | 0.04 | 20 | 1e-4 | (raw, sin, exp_mix, lin+sin) |
-| `sqrt` | 90 | 20 | 0.03 | 18 | 1e-4 | (raw, sin, relu, mul_sin_x) |
-| `multi` | 140 | 30 | 0.04 | 28 | 1e-4 | (raw, sin, tanh, relu, mul_sin_x, lin+sin) |
+| profile | top_k | beam_limit | penalty_weight $\lambda$ | mse_tie_ratio $\rho$ | max_iters | tol | max_terms | max_tree_nodes | prune_weight | prune_mse_slack | bootstrap_priors | splice_modes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `poly` | 80  | 20 | 0.015 | 0.02 | 14 | 1e-4 | 12 | 40 | 0.005 | 1.05 | True | (raw) |
+| `trig` | 120 | 25 | 0.04  | 0.03 | 25 | 1e-4 | 12 | 40 | 0.008 | 1.08 | False | (raw, sin, tanh, relu, mul_sin_x, lin+sin) |
+| `log` | 100 | 22 | 0.035 | 0.03 | 20 | 1e-4 | 10 | 36 | 0.008 | 1.08 | False | (raw, sin, exp_mix, lin+sin) |
+| `sqrt` | 90 | 20 | 0.03  | 0.03 | 18 | 1e-4 | 10 | 36 | 0.008 | 1.08 | True | (raw, sin, relu, mul_sin_x) |
+| `multi` | 140 | 30 | 0.04  | 0.03 | 28 | 1e-4 | 14 | 40 | 0.008 | 1.08 | True | (raw, sin, tanh, mul_sin_x, mul_sin_y, lin+sin) |
 
 结构先验（`_build_prior_trees(profile)`）也随 profile 注入，例如：
 
@@ -141,4 +154,8 @@ $$
 - `log`：$\{x,x^2,\exp(x),\exp(x^2),x^2\}$(按实现的树结构注入)
 - `sqrt`：$\{x,x^2,x^2\cdot x\}$(按实现的树结构注入)
 - `multi`：同时包含 `y` 变量结构（如 `sin(y)`, `cos(y)`, `sin(x)*cos(y)` 与 `x*y` 等）
+
+其中 `bootstrap_priors=True` 的 profile（如 `poly`、`multi`）会在残差迭代前先将结构先验一次性加入全局最小二乘回归，用作“先验引导”（prior-guided bootstrap），以提高高阶多项式或二维多项式/混合项在早期迭代的收敛概率。
+
+此外，最终输出公式采用“有条件剪枝”：仅当剪枝后的 MSE 不超过全量模型 MSE 的 `prune_mse_slack` 倍时，才采用更短的表达式；否则保留全量模型以确保满足成功阈值的精度要求。
 
