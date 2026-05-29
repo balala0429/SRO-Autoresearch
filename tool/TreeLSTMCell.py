@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tool.OP_TO_ID import OP_TO_ID
+
 class TreeLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super(TreeLSTMCell, self).__init__()
@@ -27,10 +29,6 @@ class TreeLSTMCell(nn.Module):
         c = i * u + f_left * c_left + f_right * c_right
         h = o * torch.tanh(c)
         return h, c
-
-
-
-OP_TO_ID = {'+': 0, '-': 1, '*': 2, '/': 3, 'sin': 4, 'exp': 5, 'x': 6, 'const': 7, 'pad': 8}
 
 
 class SymbolicEncoder(nn.Module):

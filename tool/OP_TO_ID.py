@@ -1,7 +1,24 @@
 OP_TO_ID = {
-    'PAD': 0, 'x': 1, 'const': 2,
-    '+': 3, '-': 4, '*': 5, '/': 6,
-    'sin': 7, 'exp': 8,
-    'cos': 9,   # 新增：余弦
-    'pow': 10   # 新增：幂运算
+    # padding (keep both keys for backward compatibility)
+    'PAD': 0,
+    'pad': 0,
+
+    # variables / constants
+    'x': 1,
+    'y': 2,
+    'const': 3,
+
+    # binary ops
+    '+': 4,
+    '-': 5,
+    '*': 6,
+    '/': 7,
+    'pow': 8,
+
+    # unary ops
+    'sin': 9,
+    'cos': 10,
+    'exp': 11,
+    'log': 12,
+    'sqrt': 13,
 }
