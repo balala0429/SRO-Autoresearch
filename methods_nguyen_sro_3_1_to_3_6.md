@@ -58,7 +58,7 @@ $$
 \{T_{j_1},\dots,T_{j_k}\} \leftarrow \mathrm{FAISS}(\mathbf{v}^{(t)},k).
 $$
 
-同时引入 profile-specific 的结构先验（structural priors injection），将若干与目标函数族高度相关的子树直接加入候选队列，以补足向量检索对特定结构模式的漏检风险。
+同时引入 profile-specific 的 **family atoms**（算子族原子基），将单变量/低阶子树加入候选队列，以补足向量检索对结构模式的漏检风险。**禁止**注入已知 benchmark 的完整子结构（如 $\sin(x^2)\cos(x)$、$\sin(x+x^2)$、$x^y$、$2\sin(x)\cos(y)$ 等 target-level 模板）。
 
 ### 3.3.3 Candidate Evaluation with Beam and Global Refit
 
@@ -106,7 +106,7 @@ $$
 
 1. **统一求值接口**：`eval_tree` 接收变量字典 `var_data={'x':..., 'y':...}`，递归计算树上 `x`、`y` 叶子与一元/二元算子的组合响应。
 2. **采样点构造**：对于 dim=2 的任务，在 `x_range` 与 `y_range` 上分别取离散点集 $\{x_i\}_{i=1}^{n_x}$ 与 $\{y_j\}_{j=1}^{n_y}$，并构造二维网格 $\{(x_i,y_j)\}$。实际实现采用 `meshgrid` 形成 $n_x\times n_y$ 个点，再按行/列展平为长度 $N=n_x n_y$ 的向量，从而将二维函数评估为统一的一维响应列 $\mathbf{y}\in\mathbb{R}^{N}$。
-3. **变量集合支持**：树表达式的叶子节点扩展为 `x` 与 `y`，并在 structural priors 与拼接策略中包含与二维结构相关的候选子树（例如包含 `sin(y)`、`cos(y)` 与 `sin(x)*cos(y)`）。
+3. **变量集合支持**：树表达式的叶子节点扩展为 `x` 与 `y`；multi profile 的先验仅含 family atoms（如 `sin(x)`, `cos(y)`, `x*y`），不含 benchmark 级组合项。
 
 在该扩展下，系统可以直接对 Nguyen-9~12 进行与 1D 基准一致的求解与评估流程。
 
@@ -147,13 +147,13 @@ $$
 | `sqrt` | 90 | 20 | 0.03  | 0.03 | 18 | 1e-4 | 10 | 36 | 0.008 | 1.08 | True | (raw, sin, relu, mul_sin_x) |
 | `multi` | 140 | 30 | 0.04  | 0.03 | 28 | 1e-4 | 14 | 40 | 0.008 | 1.08 | True | (raw, sin, tanh, mul_sin_x, mul_sin_y, lin+sin) |
 
-结构先验（`_build_prior_trees(profile)`）也随 profile 注入，例如：
+结构先验（`_build_prior_trees(profile)`）仅注入 **family atoms**，禁止 target-level 模板：
 
-- `poly`：$\{x,x^2,x^3,x^4,x^5,x^6\}$ 的等价树结构
-- `trig`：$\sin(x),\sin(x^2),\sin(x^2)\sin(x),x^2\sin(x),\sin(x+x^2)$
-- `log`：$\{x,x^2,\exp(x),\exp(x^2),x^2\}$(按实现的树结构注入)
-- `sqrt`：$\{x,x^2,x^2\cdot x\}$(按实现的树结构注入)
-- `multi`：同时包含 `y` 变量结构（如 `sin(y)`, `cos(y)`, `sin(x)*cos(y)` 与 `x*y` 等）
+- `poly`：$\{x,x^2,\ldots,x^6\}$
+- `trig`：$\{x,x^2,\sin(x),\cos(x),\sin(x^2)\}$（**不含** $\sin(x^2)\cos(x)$、$\sin(x+x^2)$ 等）
+- `log`：$\{x,x^2,\log(x+1),\log(x^2+1),\exp(x)\}$（**不含** $\log(x+1)+\log(x^2+1)$ 等组合）
+- `sqrt`：$\{x,x^2,\sqrt{x},\sqrt{x+1}\}$
+- `multi`：$\{x,y,x^2,y^2,\sin(x),\sin(y),\cos(x),\cos(y),\sin(y^2),x\cdot y\}$（**不含** $x^y$、$\sin(x)\cos(y)$、$\sin(x)+\sin(y^2)$ 等）
 
 其中 `bootstrap_priors=True` 的 profile（如 `poly`、`multi`）会在残差迭代前先将结构先验一次性加入全局最小二乘回归，用作“先验引导”（prior-guided bootstrap），以提高高阶多项式或二维多项式/混合项在早期迭代的收敛概率。
 

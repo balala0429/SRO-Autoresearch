@@ -96,6 +96,31 @@ PREDICTOR_2D_PATH = "weight2_2d/predictor_2d_final.pth"
 INDEX_2D_PATH = "library/library/symbolic_index_2d.bin"
 TREES_2D_PATH = "library/library/symbolic_trees_2d.pkl"
 
+
+def simplify_expression_string(expr_str, tiny_coef=1e-8):
+    """
+    用 SymPy 做后处理化简，并去掉极小系数噪声项，让表达式更简洁。
+    """
+    x_sym, y_sym = sp.symbols('x y')
+    try:
+        expr = sp.sympify(expr_str, locals={'x': x_sym, 'y': y_sym})
+        expr = sp.expand(expr)
+        if isinstance(expr, sp.Add):
+            kept_terms = []
+            for term in expr.args:
+                coeff, _ = term.as_coeff_Mul()
+                try:
+                    c = float(coeff)
+                except Exception:
+                    c = None
+                if c is None or abs(c) >= tiny_coef:
+                    kept_terms.append(term)
+            expr = sp.Add(*kept_terms) if kept_terms else sp.Integer(0)
+        expr = sp.simplify(expr)
+        return str(expr)
+    except Exception:
+        return expr_str
+
 # Nguyen 基准：name, profile, x_range, target
 NGUYEN_BENCHMARKS = [
     {
@@ -273,6 +298,157 @@ PROFILE_CONFIG = {
     },
 }
 
+# 按数据套件覆盖 profile 默认（缓解 Extra 上全局 bootstrap 过强、Feynman 上先验不足）
+SUITE_PROFILE_OVERRIDES = {
+    "nguyen": {
+        "bootstrap_mode": "full",
+        "prior_queue_cap": None,
+    },
+    "extra": {
+        "bootstrap_mode": "greedy",
+        "bootstrap_max_terms": 6,
+        "prior_queue_cap": 10,
+        "top_k_scale": 1.3,
+        "beam_limit_scale": 1.2,
+        "max_iters_scale": 1.15,
+    },
+    "feynman": {
+        "bootstrap_mode": "full",
+        "prior_queue_cap": None,
+        "top_k_scale": 1.15,
+        "beam_limit_scale": 1.1,
+        "max_iters_scale": 1.2,
+    },
+    "pmlb": {
+        "bootstrap_mode": "greedy",
+        "bootstrap_max_terms": 5,
+        "prior_queue_cap": 8,
+        "top_k_scale": 1.2,
+        "beam_limit_scale": 1.1,
+    },
+    "default": {
+        "bootstrap_mode": "full",
+        "prior_queue_cap": None,
+    },
+}
+
+
+def merge_profile_config(profile: str, suite: str | None = None) -> dict:
+    """合并 profile 与 suite 级策略，得到单次 solve 的有效配置。"""
+    base = dict(PROFILE_CONFIG.get(profile, PROFILE_CONFIG["trig"]))
+    overrides = SUITE_PROFILE_OVERRIDES.get(suite or "default", SUITE_PROFILE_OVERRIDES["default"])
+    merged = dict(base)
+    for key, val in overrides.items():
+        if key.endswith("_scale"):
+            continue
+        if val is not None:
+            merged[key] = val
+    for scale_key in ("top_k_scale", "beam_limit_scale", "max_iters_scale"):
+        scale = overrides.get(scale_key)
+        if not scale:
+            continue
+        base_key = scale_key.replace("_scale", "")
+        if base_key in merged and isinstance(merged[base_key], (int, float)):
+            merged[base_key] = int(max(1, round(float(merged[base_key]) * float(scale))))
+    if not merged.get("bootstrap_priors", True):
+        merged["bootstrap_mode"] = "off"
+    return merged
+
+
+def resolve_suite(case_or_source) -> str:
+    """从 benchmark case dict 或 source 字符串解析 suite 名。"""
+    if isinstance(case_or_source, dict):
+        if case_or_source.get("suite"):
+            return str(case_or_source["suite"])
+        name = str(case_or_source.get("name", "")).lower()
+        src = str(case_or_source.get("source", "")).lower()
+        if src in SUITE_PROFILE_OVERRIDES:
+            return src
+        if "feynman" in name or src == "feynman-sr":
+            return "feynman"
+        if src == "extra":
+            return "extra"
+        return "nguyen"
+    src = str(case_or_source or "default").lower()
+    if src in SUITE_PROFILE_OVERRIDES:
+        return src
+    if src in ("feynman-sr",):
+        return "feynman"
+    return "default"
+
+
+# 流水线消融：五档对比（no prior → full）
+PIPELINE_ABLATION_MODES = frozenset(
+    {"no_prior", "prior_only", "retrieval_only", "retrieval_plus_splice", "full"}
+)
+
+
+def apply_pipeline_ablation(cfg: dict, mode: str, profile: str) -> dict:
+    """
+    五档流水线消融（在 merge_profile_config 之后调用）：
+
+    | mode | 结构先验 | Bootstrap | 先验进 Beam | FAISS 检索 | 拼接 |
+    |------|---------|-----------|------------|-----------|------|
+    | no_prior | ✗ | ✗ | ✗ | ✗ | ✗（常数/零模型基线） |
+    | prior_only | ✓ | ✓ | ✗ | ✗ | raw |
+    | retrieval_only | ✗ | ✗ | ✗ | ✓ | raw |
+    | retrieval_plus_splice | ✗ | ✗ | ✗ | ✓ | profile |
+    | full | ✓ | ✓(suite) | ✓ | ✓ | profile |
+    """
+    if mode not in PIPELINE_ABLATION_MODES:
+        raise ValueError(f"unknown pipeline ablation mode: {mode}")
+    out = dict(cfg)
+    if mode == "no_prior":
+        out.update(
+            use_profile_priors=False,
+            use_bootstrap=False,
+            bootstrap_priors=False,
+            bootstrap_mode="off",
+            use_prior_queue=False,
+            use_retrieval=False,
+            max_iters=0,
+        )
+        return out
+    if mode == "prior_only":
+        out.update(
+            use_profile_priors=True,
+            use_bootstrap=True,
+            bootstrap_priors=True,
+            bootstrap_mode=out.get("bootstrap_mode", "full"),
+            use_prior_queue=False,
+            use_retrieval=False,
+            splice_modes=("raw",),
+            max_iters=0,
+        )
+        return out
+    if mode == "retrieval_only":
+        out.update(
+            use_profile_priors=False,
+            use_bootstrap=False,
+            bootstrap_priors=False,
+            bootstrap_mode="off",
+            use_prior_queue=False,
+            use_retrieval=True,
+            splice_modes=("raw",),
+        )
+        return out
+    if mode == "retrieval_plus_splice":
+        out.update(
+            use_profile_priors=False,
+            use_bootstrap=False,
+            bootstrap_priors=False,
+            bootstrap_mode="off",
+            use_prior_queue=False,
+            use_retrieval=True,
+        )
+        return out
+    # full
+    out.setdefault("use_profile_priors", True)
+    out.setdefault("use_bootstrap", True)
+    out.setdefault("use_prior_queue", True)
+    out.setdefault("use_retrieval", True)
+    return out
+
 
 # --- 主类：残差求解器 ---
 class ResidualSolver:
@@ -288,6 +464,7 @@ class ResidualSolver:
         self.predictor = None
         self.index = None
         self.trees = None
+        self.last_diagnostic = {}
 
     @staticmethod
     def _filter_library(index, trees):
@@ -346,7 +523,12 @@ class ResidualSolver:
 
     @staticmethod
     def _build_prior_trees(profile):
-        """按问题类型注入结构先验，避免多项式任务被三角先验污染。"""
+        """
+        按 profile 注入 **family atoms**（算子族原子基），禁止 target-level / benchmark 级模板。
+
+        原则：只提供单变量/低阶原子（如 sin(x)、x²），不提供已知 benchmark 的完整子结构
+        （如 sin(x²)cos(x)、sin(x+x²)、x^y、2sin(x)cos(y) 等）。
+        """
         x = Node('x')
         xx = Node('*', x, x)
         xxx = Node('*', xx, x)
@@ -356,44 +538,46 @@ class ResidualSolver:
             x6 = Node('*', x5, x)
             return [x, xx, xxx, x4, x5, x6]
         if profile == "trig":
-            c1 = Node('const', value=1.0)
             return [
-                c1,
+                x,
+                xx,
                 Node('sin', x),
-                Node('sin', xx),
                 Node('cos', x),
-                Node('*', Node('sin', xx), Node('cos', x)),
-                Node('*', Node('sin', xx), Node('sin', x)),
-                Node('*', xx, Node('sin', x)),
-                Node('sin', Node('+', x, xx)),
+                Node('sin', xx),
             ]
         if profile == "log":
+            c1 = Node('const', value=1.0)
+            log_x1 = Node('log', Node('+', x, c1))
+            log_xx1 = Node('log', Node('+', xx, c1))
             return [
-                x, xx,
+                x,
+                xx,
+                log_x1,
+                log_xx1,
                 Node('exp', x),
-                Node('exp', xx),
-                Node('*', x, x),
             ]
         if profile == "sqrt":
-            return [x, xx, Node('*', x, x)]
+            c1 = Node('const', value=1.0)
+            return [
+                x,
+                xx,
+                Node('sqrt', x),
+                Node('sqrt', Node('+', x, c1)),
+            ]
         if profile == "multi":
             y = Node('y')
             yy = Node('*', y, y)
-            x3 = Node('*', xx, x)
-            x4 = Node('*', x3, x)
-            half = Node('const', value=0.5)
             return [
-                x, xx, x3, x4, y, yy,
-                Node('*', yy, half),
-                Node('-', y, half),
+                x,
+                xx,
+                y,
+                yy,
                 Node('sin', x),
                 Node('sin', y),
-                Node('sin', yy),
+                Node('cos', x),
                 Node('cos', y),
-                Node('+', Node('sin', x), Node('sin', yy)),
-                Node('*', Node('sin', x), Node('cos', y)),
+                Node('sin', yy),
                 Node('*', x, y),
-                Node('pow', x, y),
             ]
         return [x, xx]
 
@@ -476,6 +660,64 @@ class ResidualSolver:
             print(f"📌 先验引导回归: {len(cols)} 项, MSE={mse:.6f}")
         return cols, entries, mse
 
+    def _bootstrap_from_priors_greedy(self, prior_trees, y_obs, verbose, max_terms=6):
+        """逐步加入先验列：仅当 MSE 下降才保留（适合 Extra / 表格 OOD）。"""
+        cols, entries = [], []
+        best_mse = float(np.mean(y_obs ** 2))
+        added = 0
+        for tree in prior_trees:
+            if added >= max_terms:
+                break
+            if not is_valid_tree(tree):
+                continue
+            py = eval_tree(tree, self.var_data)
+            if np.var(py) < 1e-6 or np.any(np.isnan(py)) or np.any(np.isinf(py)):
+                continue
+            trial_cols = cols + [py]
+            trial_entries = entries + [(tree, "raw")]
+            mse = self._omp_mse(trial_cols, y_obs)
+            if mse + 1e-15 < best_mse:
+                cols, entries = trial_cols, trial_entries
+                best_mse = mse
+                added += 1
+        if verbose and cols:
+            print(f"📌 贪心先验引导: {len(cols)} 项, MSE={best_mse:.6f}")
+        if not cols:
+            return [], [], best_mse
+        return cols, entries, best_mse
+
+    @staticmethod
+    def prior_only_mse(solver_or_self, prior_trees, y_obs, var_data):
+        """仅结构先验 + OMP，不检索库（用于失败诊断）。"""
+        solver_or_self.var_data = var_data
+        cols = []
+        for tree in prior_trees:
+            if not is_valid_tree(tree):
+                continue
+            py = eval_tree(tree, var_data)
+            if np.var(py) < 1e-6 or np.any(np.isnan(py)) or np.any(np.isinf(py)):
+                continue
+            cols.append(py)
+        if not cols:
+            return float(np.mean(y_obs ** 2))
+        return ResidualSolver._omp_mse_static(cols, y_obs)
+
+    @staticmethod
+    def _omp_mse_static(columns, y_obs):
+        if not columns:
+            return float(np.mean(y_obs ** 2))
+        A = np.column_stack(columns).astype(np.float64, copy=False)
+        A = np.clip(A, -1e6, 1e6)
+        y = np.clip(y_obs.astype(np.float64, copy=False), -1e6, 1e6)
+        try:
+            w, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+            pred = A @ w
+            if not np.all(np.isfinite(pred)):
+                return float("inf")
+            return float(np.mean((y - pred) ** 2))
+        except np.linalg.LinAlgError:
+            return float("inf")
+
     @staticmethod
     def _finalize_model(active_patches_y, active_trees, y_obs, cfg, verbose):
         """先保留全量拟合精度；仅在 MSE 几乎不变时再剪枝以提升可读性。"""
@@ -528,15 +770,63 @@ class ResidualSolver:
         expr = format_formula(w_out, entries_out)
         return entries_out, expr, mse_out
 
-    def solve(self, y_obs, max_iters=None, tol=None, profile="trig", plot=False, verbose=True):
-        cfg = PROFILE_CONFIG.get(profile, PROFILE_CONFIG["trig"])
+    def solve(
+        self,
+        y_obs,
+        max_iters=None,
+        tol=None,
+        profile="trig",
+        suite=None,
+        ablation_mode=None,
+        plot=False,
+        verbose=True,
+        trace=False,
+        record_diagnostics=False,
+    ):
+        cfg = merge_profile_config(profile, suite)
+        if ablation_mode and ablation_mode != "full":
+            cfg = apply_pipeline_ablation(cfg, ablation_mode, profile)
         if max_iters is None:
             max_iters = cfg["max_iters"]
         if tol is None:
             tol = cfg["tol"]
+        use_profile_priors = cfg.get("use_profile_priors", True)
+        use_retrieval = cfg.get("use_retrieval", True)
+
+        if ablation_mode == "no_prior":
+            baseline_mse = float(np.mean(np.asarray(y_obs, dtype=np.float64) ** 2))
+            if verbose:
+                print(f"📉 no_prior 基线: MSE={baseline_mse:.6f} (无先验/无检索)")
+            if record_diagnostics:
+                self.last_diagnostic = {
+                    "profile": profile,
+                    "suite": suite or "default",
+                    "ablation_mode": "no_prior",
+                    "final_mse": baseline_mse,
+                }
+            return baseline_mse, "0"
+
         # 确保 predictor/索引与当前输入维度一致（1D:127, 2D:32*32）
-        self._ensure_assets(profile=profile, num_points=int(len(y_obs)))
-        prior_trees = [t for t in self._build_prior_trees(profile) if is_valid_tree(t)]
+        if use_retrieval:
+            self._ensure_assets(profile=profile, num_points=int(len(y_obs)))
+        prior_trees = (
+            [t for t in self._build_prior_trees(profile) if is_valid_tree(t)]
+            if use_profile_priors
+            else []
+        )
+        diag = {
+            "profile": profile,
+            "suite": suite or "default",
+            "ablation_mode": ablation_mode or "full",
+            "bootstrap_mode": cfg.get("bootstrap_mode", "full"),
+            "n_prior_trees": len(prior_trees),
+            "prior_only_mse": self.prior_only_mse(self, prior_trees, y_obs, self.var_data),
+            "bootstrap_mse": None,
+            "n_bootstrap_terms": 0,
+            "max_faiss_similarity": None,
+            "n_active_terms": 0,
+            "input_points": int(len(y_obs)),
+        }
         max_terms = cfg.get("max_terms", 12)
         max_tree_nodes = cfg.get("max_tree_nodes", 40)
         penalty_weight = cfg.get("penalty_weight", 0.04)
@@ -544,27 +834,100 @@ class ResidualSolver:
 
         if verbose:
             print("=" * 50)
-            print(f"🚀 SRO 推理 | profile={profile} | max_iters={max_iters} tol={tol}")
+            print(
+                f"🚀 SRO 推理 | profile={profile} | suite={suite or 'default'} | "
+                f"mode={ablation_mode or 'full'} | max_iters={max_iters} tol={tol}"
+            )
             print("=" * 50)
 
         # 记录已被选中的组件（波形和树结构）
         active_patches_y = []
         active_trees = []
         self.fit_history = []
+        self.solve_trace = [] if trace else None
 
-        if cfg.get("bootstrap_priors"):
-            boot_cols, boot_entries, boot_mse = self._bootstrap_from_priors(
-                prior_trees, y_obs, verbose
-            )
+        def _trace(event, **kwargs):
+            if trace:
+                self.solve_trace.append({"event": event, **kwargs})
+
+        _trace(
+            "start",
+            profile=profile,
+            suite=suite or "default",
+            ablation_mode=ablation_mode or "full",
+            n_prior_atoms=len(prior_trees),
+        )
+
+        boot_mode = cfg.get("bootstrap_mode", "full")
+        use_bootstrap = (
+            bool(cfg.get("use_bootstrap", True))
+            and bool(cfg.get("bootstrap_priors", True))
+            and boot_mode != "off"
+            and use_profile_priors
+        )
+        if use_bootstrap:
+            if boot_mode == "greedy":
+                boot_cols, boot_entries, boot_mse = self._bootstrap_from_priors_greedy(
+                    prior_trees,
+                    y_obs,
+                    verbose,
+                    max_terms=int(cfg.get("bootstrap_max_terms", 6)),
+                )
+            else:
+                boot_cols, boot_entries, boot_mse = self._bootstrap_from_priors(
+                    prior_trees, y_obs, verbose
+                )
+            diag["bootstrap_mse"] = float(boot_mse)
+            diag["n_bootstrap_terms"] = len(boot_cols)
             active_patches_y.extend(boot_cols)
             active_trees.extend(boot_entries)
+            if boot_cols:
+                _w, _boot_expr, _ = self._finalize_model(
+                    active_patches_y, active_trees, y_obs, cfg, verbose=False
+                )
+                _trace(
+                    "bootstrap",
+                    n_terms=len(boot_cols),
+                    mse=float(boot_mse),
+                    terms=[entry_to_str(e) for e in boot_entries],
+                    formula=_boot_expr,
+                )
             if boot_mse < tol:
                 if verbose:
                     print(f"✅ 先验引导已收敛 (MSE: {boot_mse:.6f})")
                 _, best_expr, final_mse = self._finalize_model(
                     active_patches_y, active_trees, y_obs, cfg, verbose
                 )
-                return final_mse, best_expr
+                diag["final_mse"] = float(final_mse)
+                diag["n_active_terms"] = len(active_trees)
+                if record_diagnostics:
+                    self.last_diagnostic = diag
+                return final_mse, simplify_expression_string(best_expr)
+
+        if not use_retrieval or max_iters <= 0:
+            if active_patches_y:
+                _, best_expr, final_mse = self._finalize_model(
+                    active_patches_y, active_trees, y_obs, cfg, verbose
+                )
+            else:
+                final_mse = float(np.mean(y_obs ** 2))
+                best_expr = "0"
+            diag["final_mse"] = float(final_mse)
+            diag["n_active_terms"] = len(active_trees)
+            if record_diagnostics:
+                self.last_diagnostic = diag
+            if verbose and ablation_mode == "prior_only":
+                print(f"✅ prior_only 完成: MSE={final_mse:.6f}")
+            return final_mse, simplify_expression_string(best_expr)
+
+        prior_cap = cfg.get("prior_queue_cap")
+        use_prior_queue = cfg.get("use_prior_queue", True) and use_profile_priors
+        if use_prior_queue:
+            prior_for_queue = (
+                prior_trees[: int(prior_cap)] if prior_cap is not None else prior_trees
+            )
+        else:
+            prior_for_queue = []
 
         for step in range(1, max_iters + 1):
             # 1. 计算当前残差
@@ -591,10 +954,12 @@ class ResidualSolver:
             if mse_current < tol:
                 if verbose:
                     print(f"\n✅ 达到收敛精度 (MSE: {mse_current:.6f})，提前结束拟合。")
+                _trace("converged", round=step, mse=float(mse_current))
                 break
 
             if verbose:
                 print(f"\n--- 第 {step} 轮迭代 | 当前 MSE: {mse_current:.4f} ---")
+            _trace("round_start", round=step, residual_mse=float(mse_current), n_active=len(active_trees))
 
             # 2. 雷达探测
             y_norm = normalize_y(res)
@@ -612,12 +977,16 @@ class ResidualSolver:
             penalty_weight = cfg["penalty_weight"]
             splice_modes = cfg["splice_modes"]
             similarities, indices = self.index.search(v_pred_np, top_k_search)
+            if step == 1 and similarities.size:
+                diag["max_faiss_similarity"] = float(np.max(similarities))
 
             best_patch_cols = None
             best_patch_entries = None
             best_tree = None
             best_mse_pick = float('inf')
             best_complexity_pick = float('inf')
+            best_splice_tag = "raw"
+            round_candidates = []
 
             # 4. Beam Search + 多样性去重 + 全局重拟合评估
             if verbose:
@@ -626,7 +995,8 @@ class ResidualSolver:
             valid_candidates = 0
             candidate_queue = [(self.trees[idx], float(similarities[0][i]))
                                for i, idx in enumerate(indices[0])]
-            candidate_queue = [(t, 1.0) for t in prior_trees] + candidate_queue
+            candidate_queue = [(t, 1.0) for t in prior_for_queue] + candidate_queue
+            prior_strs = {tree_to_str(t) for t in prior_for_queue if is_valid_tree(t)}
 
             for candidate_tree, sim in candidate_queue:
                 if not is_valid_tree(candidate_tree):
@@ -667,16 +1037,31 @@ class ResidualSolver:
                 variants = self._build_splice_variants(candidate_tree, patch_y, splice_modes)
                 test_mse = float('inf')
                 best_variant = None
-                for cols, entries, _tag in variants:
+                best_variant_tag = "raw"
+                variant_scores = []
+                for cols, entries, vtag in variants:
                     if any(np.any(np.isnan(c)) or np.any(np.isinf(c)) for c in cols):
                         continue
                     mse = self._omp_mse(active_patches_y + cols, y_obs)
+                    added = [entry_to_str(e) for e in entries]
+                    variant_scores.append({"splice": vtag, "mse": float(mse), "terms": added})
                     if mse < test_mse:
                         test_mse = mse
                         best_variant = (cols, entries)
+                        best_variant_tag = vtag
 
                 if best_variant is None:
                     continue
+
+                cand_record = {
+                    "candidate": tree_str,
+                    "source": "prior" if tree_str in prior_strs else "faiss",
+                    "similarity": float(sim),
+                    "best_splice": best_variant_tag,
+                    "mse": float(test_mse),
+                    "variants": variant_scores,
+                }
+                round_candidates.append(cand_record)
 
                 complexity = get_tree_size(candidate_tree)
                 if complexity > max_tree_nodes:
@@ -707,8 +1092,10 @@ class ResidualSolver:
                     best_complexity_pick = complexity_pick
                     best_patch_cols, best_patch_entries = best_variant
                     best_tree = candidate_tree
+                    best_splice_tag = best_variant_tag
 
             if best_tree is None:
+                _trace("round_no_pick", round=step, candidates=round_candidates)
                 break
             if len(active_patches_y) + len(best_patch_cols) > max_terms:
                 if verbose:
@@ -720,7 +1107,6 @@ class ResidualSolver:
                 active_patches_y.append(col)
                 active_trees.append(entry)
 
-            # 算一下新阵列的实时系数，仅用于打印展示
             A_new = np.clip(
                 np.column_stack(active_patches_y).astype(np.float64, copy=False),
                 -1e6,
@@ -728,8 +1114,25 @@ class ResidualSolver:
             )
             y_new = np.clip(y_obs.astype(np.float64, copy=False), -1e6, 1e6)
             w_new, _, _, _ = np.linalg.lstsq(A_new, y_new, rcond=None)
+            cum_expr = format_formula(w_new, active_trees)
+            cum_mse = float(np.mean((y_new - A_new @ w_new) ** 2))
+            added_labels = [entry_to_str(e) for e in best_patch_entries]
+            _trace(
+                "round_pick",
+                round=step,
+                candidate=tree_to_str(best_tree),
+                splice=best_splice_tag,
+                added_terms=added_labels,
+                pick_mse=float(best_mse_pick),
+                cumulative_mse=cum_mse,
+                cumulative_formula=cum_expr,
+                candidates=round_candidates,
+            )
             if verbose:
-                print(f"🎯 选定补丁: [{tree_to_str(best_tree)}]。全局系数重整中...")
+                print(f"🎯 选定补丁: [{tree_to_str(best_tree)}] splice={best_splice_tag}。全局系数重整中...")
+                print(f"   累计 MSE={cum_mse:.6f} | F={cum_expr}")
+
+            # 算一下新阵列的实时系数，仅用于打印展示（w_new 已算）
 
             # 熔断机制：新加入列的系数均趋零则视为收敛
             n_new = len(best_patch_cols)
@@ -767,10 +1170,10 @@ class ResidualSolver:
             try:
                 x_sym, y_sym = sp.symbols('x y')
                 simplified_expr = sp.simplify(sp.sympify(final_str, locals={'x': x_sym, 'y': y_sym}))
-                best_expr = str(simplified_expr)
+                best_expr = simplify_expression_string(str(simplified_expr))
             except Exception:
                 simplified_expr = final_str
-                best_expr = final_str
+                best_expr = simplify_expression_string(final_str)
             if verbose:
                 print("=" * 50)
                 print("🏆 拟合公式:")
@@ -787,6 +1190,11 @@ class ResidualSolver:
                 print("=" * 50)
                 print(f"未找到有效组件，最终 MSE: {final_mse:.6f}")
 
+        diag["final_mse"] = float(final_mse)
+        diag["n_active_terms"] = len(active_trees) if active_patches_y else 0
+        _trace("finish", final_mse=float(final_mse), formula=best_expr, n_terms=len(active_trees))
+        if record_diagnostics:
+            self.last_diagnostic = diag
         return final_mse, best_expr
 
 
@@ -819,6 +1227,7 @@ def run_nguyen_benchmark(solver, benchmarks=None, plot_last=False, verbose_per_c
         mse, expr = solver.solve(
             y_obs=y_obs,
             profile=profile,
+            suite=resolve_suite(case),
             plot=do_plot,
             verbose=verbose_per_case,
         )
@@ -852,6 +1261,7 @@ def run_nguyen_repeated_benchmark(
     num_trials=100,
     use_cache=True,
     verbose_per_case=False,
+    ablation_mode=None,
 ):
     """
     跑 10 轮，每轮每个表达式跑 100 次，统计 Success Rate。
@@ -882,11 +1292,13 @@ def run_nguyen_repeated_benchmark(
         else:
             y_obs = case["target"](var_data["x"])
 
-        # 只算一次：用结果复制到 rounds*trials
+        # 只算一次：用结果复制到 rounds*trials（流水线消融请设 use_cache=False）
         if use_cache:
             mse, expr = solver.solve(
                 y_obs=y_obs,
                 profile=profile,
+                suite=resolve_suite(case),
+                ablation_mode=ablation_mode,
                 plot=False,
                 verbose=verbose_per_case,
             )
@@ -908,6 +1320,8 @@ def run_nguyen_repeated_benchmark(
                 mse_i, expr_i = solver.solve(
                     y_obs=y_obs,
                     profile=profile,
+                    suite=resolve_suite(case),
+                    ablation_mode=ablation_mode,
                     plot=False,
                     verbose=False,
                 )
