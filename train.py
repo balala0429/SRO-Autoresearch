@@ -496,11 +496,29 @@ class ResidualSolver:
             if profile == "multi" and num_points == NX_2D * NY_2D and os.path.exists(PREDICTOR_2D_PATH):
                 predictor = ResidualPredictor(input_dim=num_points, output_dim=128).to(device)
                 predictor.load_state_dict(torch.load(PREDICTOR_2D_PATH, map_location=torch.device("cpu")))
+                predictor.eval()
+                self._predictor_cache[pred_key] = predictor
+            elif os.path.exists("weight2/predictor_final.pth"):
+                # 1D predictor 权重文件存在
+                try:
+                    predictor = ResidualPredictor(input_dim=num_points, output_dim=128).to(device)
+                    predictor.load_state_dict(torch.load("weight2/predictor_final.pth", map_location=torch.device("cpu")))
+                    predictor.eval()
+                    self._predictor_cache[pred_key] = predictor
+                except RuntimeError as e:
+                    # 维度不匹配，创建随机初始化的 predictor（降级处理）
+                    if "size mismatch" in str(e):
+                        print(f"⚠️ Predictor 维度不匹配 (expected {num_points}), 使用随机初始化")
+                        predictor = ResidualPredictor(input_dim=num_points, output_dim=128).to(device)
+                        predictor.eval()
+                        self._predictor_cache[pred_key] = predictor
+                    else:
+                        raise
             else:
+                # 权重文件不存在，创建随机初始化的 predictor
                 predictor = ResidualPredictor(input_dim=num_points, output_dim=128).to(device)
-                predictor.load_state_dict(torch.load("weight2/predictor_final.pth", map_location=torch.device("cpu")))
-            predictor.eval()
-            self._predictor_cache[pred_key] = predictor
+                predictor.eval()
+                self._predictor_cache[pred_key] = predictor
 
         self.predictor = self._predictor_cache[pred_key]
 
