@@ -333,7 +333,8 @@ SUITE_PROFILE_OVERRIDES = {
 }
 
 
-def merge_profile_config(profile: str, suite: str | None = None) -> dict:
+from typing import Optional
+def merge_profile_config(profile: str, suite: Optional[str] = None) -> dict:
     """合并 profile 与 suite 级策略，得到单次 solve 的有效配置。"""
     base = dict(PROFILE_CONFIG.get(profile, PROFILE_CONFIG["trig"]))
     overrides = SUITE_PROFILE_OVERRIDES.get(suite or "default", SUITE_PROFILE_OVERRIDES["default"])
@@ -580,6 +581,81 @@ class ResidualSolver:
                 Node('*', x, y),
             ]
         return [x, xx]
+
+    def _build_composed_candidates(self, prior_trees, profile):
+        """
+        R11: 从 prior_trees 构建组合候选树，包括乘法组合和加法结构。
+        专门用于发现有理函数结构（如 x²*y²/(x+y)）。
+        """
+        from tool.rational_mutation import deep_copy_tree
+        
+        composed = []
+        
+        # 1. 基础组合：prior_trees 的两两组合
+        for i, t1 in enumerate(prior_trees):
+            for t2 in prior_trees[i:]:
+                # 乘法组合
+                mul_tree = Node('*', left=deep_copy_tree(t1), right=deep_copy_tree(t2))
+                if is_valid_tree(mul_tree):
+                    composed.append(mul_tree)
+                
+                # 加法组合（如果包含双变量）
+                if profile == 'multi' and 'y' in tree_to_str(t1) and 'y' in tree_to_str(t2):
+                    add_tree = Node('+', left=deep_copy_tree(t1), right=deep_copy_tree(t2))
+                    if is_valid_tree(add_tree):
+                        composed.append(add_tree)
+        
+        # 2. 高阶组合：嵌套组合
+        # 生成 x²*y², x²+y² 等结构
+        if profile == 'multi':
+            x = Node('x')
+            y = Node('y')
+            xx = Node('*', x, x)
+            yy = Node('*', y, y)
+            
+            # x²*y²
+            x2y2 = Node('*', deep_copy_tree(xx), deep_copy_tree(yy))
+            composed.append(x2y2)
+            
+            # x+y, x-y
+            composed.append(Node('+', x, y))
+            composed.append(Node('-', x, y))
+            
+            # (x²)*(y²), (x²)+(y²)
+            composed.append(Node('*', deep_copy_tree(xx), deep_copy_tree(yy)))
+            composed.append(Node('+', deep_copy_tree(xx), deep_copy_tree(yy)))
+            
+            # x*y 的幂次
+            xy = Node('*', x, y)
+            composed.append(Node('*', deep_copy_tree(xy), deep_copy_tree(xy)))
+        
+        # 3. 三角函数组合
+        if profile in ['trig', 'multi']:
+            for t in prior_trees:
+                sin_t = Node('sin', deep_copy_tree(t))
+                cos_t = Node('cos', deep_copy_tree(t))
+                if is_valid_tree(sin_t):
+                    composed.append(sin_t)
+                if is_valid_tree(cos_t):
+                    composed.append(cos_t)
+                
+                # sin(t) * cos(t)
+                sin_cos = Node('*', sin_t, cos_t)
+                if is_valid_tree(sin_cos):
+                    composed.append(sin_cos)
+        
+        # 4. 对数/指数组合
+        if profile in ['log', 'multi']:
+            for t in prior_trees[:5]:  # 限制数量避免爆炸
+                exp_t = Node('exp', deep_copy_tree(t))
+                if is_valid_tree(exp_t):
+                    composed.append(exp_t)
+                
+                log_t = Node('log', deep_copy_tree(t))
+                if is_valid_tree(log_t):
+                    composed.append(log_t)
+        
+        return composed
 
     def _omp_mse(self, columns, y_obs):
         if not columns:
@@ -857,6 +933,146 @@ class ResidualSolver:
             ablation_mode=ablation_mode or "full",
             n_prior_atoms=len(prior_trees),
         )
+
+        # R11: Predictor-guided rational search
+        # 在 bootstrap 之前尝试构造有理函数结构
+        if profile == 'multi':
+            from tool.rational_mutation import deep_copy_tree
+            
+            # 1. 构建 composed_trees 候选池
+            composed_trees = self._build_composed_candidates(prior_trees, profile)
+            if verbose:
+                print(f"📐 R11: 构建 {len(composed_trees)} 个组合候选")
+            
+            # 2. 提取高价值种子（专门搜索目标模式）
+            high_value_seeds = []
+            target_patterns = ['((x * x) * (y * y))', '((y * y) * (x * x))']
+            
+            # 第一遍：专门搜索目标模式（不计数限制）
+            for t in composed_trees:
+                if not is_valid_tree(t):
+                    continue
+                s = tree_to_str(t)
+                if s in target_patterns:
+                    high_value_seeds.append(t)
+            
+            # 第二遍：补充其他包含乘方的双变量候选（限制 50 个）
+            for t in composed_trees:
+                if not is_valid_tree(t):
+                    continue
+                s = tree_to_str(t)
+                if t not in high_value_seeds:
+                    # 检查是否包含乘方模式
+                    if any(p in s for p in ['(x * x)', '(y * y)', '(x * y)', 'sqrt((x * y))']):
+                        high_value_seeds.append(t)
+                        if len(high_value_seeds) >= 50:
+                            break
+            
+            if verbose:
+                print(f"✖️ R11: 提取 {len(high_value_seeds)} 个高价值种子")
+            
+            # 3. 提取加法结构（x+y, x-y 等）用于比值构造
+            additive_candidates = []
+            # 优先提取双变量加法（x+y, x-y 等）
+            for t in composed_trees:
+                if not is_valid_tree(t):
+                    continue
+                s = tree_to_str(t)
+                if s in ['(x + y)', '(x - y)', '(y + x)', '(y - x)']:
+                    additive_candidates.insert(0, t)  # 插入到开头，优先使用
+                    if len(additive_candidates) >= 10:
+                        break
+            
+            # 如果没找到双变量加法，再提取其他加法结构
+            if len(additive_candidates) < 10:
+                for t in composed_trees:
+                    if not is_valid_tree(t):
+                        continue
+                    s = tree_to_str(t)
+                    if ' + ' in s or ' - ' in s:
+                        if s.startswith('(') and s.endswith(')'):
+                            inner = s[1:-1]
+                            if ' + ' in inner or ' - ' in inner:
+                                parts_plus = inner.split(' + ')
+                                parts_minus = inner.split(' - ')
+                                if len(parts_plus) == 2 or len(parts_minus) == 2:
+                                    if t not in additive_candidates:
+                                        additive_candidates.append(t)
+                                        if len(additive_candidates) >= 50:
+                                            break
+            
+            if verbose:
+                print(f"➕ R11: 提取 {len(additive_candidates)} 个加法结构候选")
+            
+            # 4. 构造两两之比（a/b 和 b/a）
+            pair_ratio_candidates = []
+            
+            # 分别从乘法和加法候选中选取，确保两者都参与
+            multiplicative_subset = (high_value_seeds + composed_trees)[:200]
+            additive_subset = additive_candidates[:50]
+            
+            # 构造比值：乘法 / 加法（如 x²*y²/(x+y)）
+            ratio_count = 0
+            for ta in multiplicative_subset:
+                for tb in additive_subset:
+                    for num, den in [(ta, tb), (tb, ta)]:
+                        ratio_tree = Node('/', left=deep_copy_tree(num), right=deep_copy_tree(den))
+                        if is_valid_tree(ratio_tree):
+                            pair_ratio_candidates.append(ratio_tree)
+                            ratio_count += 1
+                    if ratio_count >= 3000:
+                        break
+                if ratio_count >= 3000:
+                    break
+            
+            if verbose:
+                print(f"🔢 R11: 构造 {len(pair_ratio_candidates)} 个比值候选")
+            
+            # 5. 评估比值候选
+            best_rational_mse = float('inf')
+            best_rational_expr = None
+            
+            for ratio_tree in pair_ratio_candidates:
+                if not is_valid_tree(ratio_tree):
+                    continue
+                try:
+                    patch_y = eval_tree(ratio_tree, self.var_data)
+                    if np.var(patch_y) < 1e-6 or np.any(np.isnan(patch_y)) or np.any(np.isinf(patch_y)):
+                        continue
+                    
+                    dot_prod = np.dot(patch_y, y_obs)
+                    norm_sq = np.dot(patch_y, patch_y)
+                    if norm_sq < 1e-12:
+                        continue
+                    w = dot_prod / norm_sq
+                    
+                    residual = y_obs - w * patch_y
+                    mse = float(np.mean(residual ** 2))
+                    
+                    if mse < best_rational_mse:
+                        best_rational_mse = mse
+                        tree_str = tree_to_str(ratio_tree)
+                        best_rational_expr = f"{w:.6g}*{tree_str}" if abs(w - 1.0) > 1e-6 else tree_str
+                except Exception:
+                    continue
+            
+            if verbose and best_rational_mse < 1e-3:
+                print(f"🔢 R11 最佳比值匹配: MSE={best_rational_mse:.6e} → {best_rational_expr}")
+            
+            # 6. 如果找到精确匹配，直接返回
+            if best_rational_mse < tol and best_rational_expr is not None:
+                if verbose:
+                    print(f"🎯 R11 直接匹配成功! MSE={best_rational_mse:.6e}")
+                    print(f"   Expression: {best_rational_expr}")
+                diag["final_mse"] = float(best_rational_mse)
+                diag["n_active_terms"] = 1
+                diag["r11_direct_match"] = True
+                if record_diagnostics:
+                    self.last_diagnostic = diag
+                return best_rational_mse, simplify_expression_string(best_rational_expr)
+            
+            # 将比值候选加入 prior_trees，用于后续 bootstrap
+            prior_trees = pair_ratio_candidates + prior_trees
 
         boot_mode = cfg.get("bootstrap_mode", "full")
         use_bootstrap = (
