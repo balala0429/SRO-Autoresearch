@@ -1059,10 +1059,116 @@ class ResidualSolver:
             if verbose and best_rational_mse < 1e-3:
                 print(f"🔢 R11 最佳比值匹配: MSE={best_rational_mse:.6e} → {best_rational_expr}")
             
+            # R12: 嵌套有理函数搜索 - 对最佳比值进行幂次扩展和结构增强
+            if len(pair_ratio_candidates) > 0 and best_rational_mse < 1e-2:
+                # 获取最佳比值候选（用于扩展）
+                best_ratio_candidates = []
+                for ratio_tree in pair_ratio_candidates:
+                    if not is_valid_tree(ratio_tree):
+                        continue
+                    try:
+                        patch_y = eval_tree(ratio_tree, self.var_data)
+                        if np.var(patch_y) < 1e-6 or np.any(np.isnan(patch_y)) or np.any(np.isinf(patch_y)):
+                            continue
+                        
+                        dot_prod = np.dot(patch_y, y_obs)
+                        norm_sq = np.dot(patch_y, patch_y)
+                        if norm_sq < 1e-12:
+                            continue
+                        w = dot_prod / norm_sq
+                        
+                        residual = y_obs - w * patch_y
+                        mse = float(np.mean(residual ** 2))
+                        
+                        if mse < 1e-2:  # 只扩展 MSE < 1e-2 的候选
+                            best_ratio_candidates.append((ratio_tree, mse))
+                    except Exception:
+                        continue
+                
+                # 按 MSE 排序，取前 10 个进行扩展
+                best_ratio_candidates.sort(key=lambda x: x[1])
+                best_ratio_candidates = best_ratio_candidates[:10]
+                
+                if verbose:
+                    print(f"🔬 R12: 对 {len(best_ratio_candidates)} 个最佳比值进行嵌套扩展")
+                
+                nested_candidates = []
+                
+                # 1. 幂次扩展：(a/b)², (a/b)³
+                for ratio_tree, mse in best_ratio_candidates:
+                    for power in [2, 3]:
+                        power_tree = Node('pow', left=deep_copy_tree(ratio_tree), right=Node('const', value=float(power)))
+                        if is_valid_tree(power_tree):
+                            nested_candidates.append(power_tree)
+                
+                # 2. 分母乘法扩展：a/(b*c), a/(b*(c+d))
+                if len(additive_candidates) >= 2:
+                    for ratio_tree, mse in best_ratio_candidates[:5]:
+                        # 提取原比值的分子和分母
+                        if ratio_tree.op == '/':
+                            numerator = ratio_tree.left
+                            denominator = ratio_tree.right
+                            
+                            # 尝试将分母与其他加法结构相乘
+                            for add_tree in additive_candidates[:5]:
+                                if add_tree is not denominator:
+                                    # a / (b * c)
+                                    new_den = Node('*', left=deep_copy_tree(denominator), right=deep_copy_tree(add_tree))
+                                    new_ratio = Node('/', left=deep_copy_tree(numerator), right=new_den)
+                                    if is_valid_tree(new_ratio):
+                                        nested_candidates.append(new_ratio)
+                
+                # 3. 分子加法扩展：(a+b)/c
+                if len(high_value_seeds) >= 2:
+                    for ratio_tree, mse in best_ratio_candidates[:5]:
+                        if ratio_tree.op == '/':
+                            numerator = ratio_tree.left
+                            denominator = ratio_tree.right
+                            
+                            # 尝试将分子与其他高价值种子相加
+                            for hv_tree in high_value_seeds[:5]:
+                                if hv_tree is not numerator:
+                                    # (a + b) / c
+                                    new_num = Node('+', left=deep_copy_tree(numerator), right=deep_copy_tree(hv_tree))
+                                    new_ratio = Node('/', left=new_num, right=deep_copy_tree(denominator))
+                                    if is_valid_tree(new_ratio):
+                                        nested_candidates.append(new_ratio)
+                
+                if verbose:
+                    print(f"🧬 R12: 构造 {len(nested_candidates)} 个嵌套候选")
+                
+                # 评估嵌套候选
+                for nested_tree in nested_candidates:
+                    if not is_valid_tree(nested_tree):
+                        continue
+                    try:
+                        patch_y = eval_tree(nested_tree, self.var_data)
+                        if np.var(patch_y) < 1e-6 or np.any(np.isnan(patch_y)) or np.any(np.isinf(patch_y)):
+                            continue
+                        
+                        dot_prod = np.dot(patch_y, y_obs)
+                        norm_sq = np.dot(patch_y, patch_y)
+                        if norm_sq < 1e-12:
+                            continue
+                        w = dot_prod / norm_sq
+                        
+                        residual = y_obs - w * patch_y
+                        mse = float(np.mean(residual ** 2))
+                        
+                        if mse < best_rational_mse:
+                            best_rational_mse = mse
+                            tree_str = tree_to_str(nested_tree)
+                            best_rational_expr = f"{w:.6g}*{tree_str}" if abs(w - 1.0) > 1e-6 else tree_str
+                    except Exception:
+                        continue
+                
+                if verbose and best_rational_mse < 1e-3:
+                    print(f"🧬 R12 最佳嵌套匹配: MSE={best_rational_mse:.6e} → {best_rational_expr}")
+            
             # 6. 如果找到精确匹配，直接返回
             if best_rational_mse < tol and best_rational_expr is not None:
                 if verbose:
-                    print(f"🎯 R11 直接匹配成功! MSE={best_rational_mse:.6e}")
+                    print(f"🎯 R11/R12 直接匹配成功! MSE={best_rational_mse:.6e}")
                     print(f"   Expression: {best_rational_expr}")
                 diag["final_mse"] = float(best_rational_mse)
                 diag["n_active_terms"] = 1
