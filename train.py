@@ -934,6 +934,28 @@ class ResidualSolver:
             n_prior_atoms=len(prior_trees),
         )
 
+        # R16: 元学习策略推荐（基于历史经验）
+        r16_decision = None
+        if profile == 'multi':
+            from tool.meta_learning import r16_meta_learning_recommendation
+            
+            r16_best, r16_scores, r16_confidence = r16_meta_learning_recommendation(
+                y_obs,
+                task_id=suite or "unknown",
+                suite=suite or "default",
+                bootstrap_mse=None,
+                verbose=verbose,
+            )
+            
+            r16_decision = {
+                "best_strategy": r16_best,
+                "scores": r16_scores,
+                "confidence": r16_confidence,
+            }
+            diag["r16_strategy"] = r16_best
+            diag["r16_scores"] = r16_scores
+            diag["r16_confidence"] = r16_confidence
+
         # R14: 自适应策略选择
         r14_decision = None
         if profile == 'multi':
@@ -1584,6 +1606,47 @@ class ResidualSolver:
         diag["final_mse"] = float(final_mse)
         diag["n_active_terms"] = len(active_trees) if active_patches_y else 0
         _trace("finish", final_mse=float(final_mse), formula=best_expr, n_terms=len(active_trees))
+        
+        # R16: 记录求解经验
+        if profile == 'multi' and r16_decision is not None:
+            try:
+                from tool.meta_learning import r16_record_experience
+                
+                # 收集各策略的结果
+                strategy_results = {}
+                if diag.get("r13_direct_match"):
+                    strategy_results["r13"] = {"success": True, "mse": float(final_mse)}
+                if diag.get("r11_direct_match"):
+                    strategy_results["r11"] = {"success": True, "mse": float(final_mse)}
+                if diag.get("bootstrap_mse") is not None:
+                    strategy_results["bootstrap"] = {
+                        "success": diag["bootstrap_mse"] < tol,
+                        "mse": float(diag["bootstrap_mse"]),
+                    }
+                
+                # 确定最佳策略
+                best_strategy = r16_decision["best_strategy"]
+                if diag.get("r13_direct_match"):
+                    best_strategy = "r13"
+                elif diag.get("r11_direct_match"):
+                    best_strategy = "r11"
+                elif diag.get("bootstrap_mse") is not None and diag["bootstrap_mse"] < tol:
+                    best_strategy = "bootstrap"
+                
+                r16_record_experience(
+                    task_id=suite or "unknown",
+                    suite=suite or "default",
+                    y_obs=y_obs,
+                    strategy_results=strategy_results,
+                    best_strategy=best_strategy,
+                    final_mse=float(final_mse),
+                    final_expr=best_expr,
+                    bootstrap_mse=diag.get("bootstrap_mse"),
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ R16 经验记录失败: {e}")
+        
         if record_diagnostics:
             self.last_diagnostic = diag
         return final_mse, best_expr
