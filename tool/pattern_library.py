@@ -89,7 +89,7 @@ class PatternLibrary:
             }
         ))
         
-        # 扩展模式：x²*y/(x+y)
+        # 扩展模式：x²*y/(x+y) — Vladislavleva-4
         x2y = Node('*', x2, y)
         ratio_3 = Node('/', x2y, x_plus_y)
         
@@ -102,6 +102,38 @@ class PatternLibrary:
                 "type": "rational",
                 "numerator_degree": 3,
                 "denominator_degree": 1,
+            }
+        ))
+        
+        # 扩展模式：x*y²/(x+y) — Vladislavleva-5
+        xy2 = Node('*', x, y2)
+        ratio_4 = Node('/', xy2, x_plus_y)
+        
+        self.patterns.append(HighValuePattern(
+            name="xy2_over_sum",
+            tree=ratio_4,
+            mse=0.0,
+            metadata={
+                "source": "R15_fix",
+                "type": "rational",
+                "numerator_degree": 3,
+                "denominator_degree": 1,
+            }
+        ))
+        
+        # 扩展模式：(x+y)/(x*y+1) — Livermore-7
+        xy_plus_1 = Node('+', Node('*', x, y), Node('const', value=1.0))
+        ratio_5 = Node('/', x_plus_y, xy_plus_1)
+        
+        self.patterns.append(HighValuePattern(
+            name="sum_over_prod_plus_1",
+            tree=ratio_5,
+            mse=0.0,
+            metadata={
+                "source": "R15_fix",
+                "type": "rational",
+                "numerator_degree": 1,
+                "denominator_degree": 2,
             }
         ))
     

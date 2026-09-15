@@ -92,15 +92,19 @@ class StrategyEvaluator:
     
     def _evaluate_r13_pattern(self, features: TaskFeatures) -> float:
         """评估 R13 模式库匹配策略"""
-        score = 0.0
+        # 模式库匹配成本低，始终给予基础分
+        score = 0.15
         
         # 如果 bootstrap MSE 很低，说明任务简单，模式库可能直接匹配
         if features.bootstrap_mse is not None and features.bootstrap_mse < 1e-6:
             score += 0.8
         
-        # 如果数据范围适中，模式库更可能匹配
+        # 数据范围适中时模式库更可能匹配
         if 0.1 < features.y_range < 10.0:
             score += 0.2
+        elif features.y_range >= 10.0:
+            # 大范围任务也可能匹配有理函数模式
+            score += 0.1
         
         return score
     

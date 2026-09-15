@@ -1099,6 +1099,27 @@ class ResidualSolver:
             if verbose:
                 print(f"➕ R11: 提取 {len(additive_candidates)} 个加法结构候选")
             
+            # 3.5 R15: 构造乘法+常数分母（如 x*y+1, x*y-1）
+            # 这类分母不在 composed_trees 中，需要手动构造
+            from tool.Node import Node
+            _x = Node('x')
+            _y = Node('y')
+            _one = Node('const', value=1.0)
+            _minus_one = Node('const', value=-1.0)
+            _xy = Node('*', _x, _y)
+            
+            extra_denominators = [
+                Node('+', _xy, _one),       # x*y + 1
+                Node('-', _xy, _one),       # x*y - 1
+                Node('+', Node('+', _xy, _one), Node('*', _x, _y)),  # 2*x*y + 1
+            ]
+            for den in extra_denominators:
+                if is_valid_tree(den) and den not in additive_candidates:
+                    additive_candidates.append(den)
+            
+            if verbose:
+                print(f"🔧 R15: 添加 {len(extra_denominators)} 个乘法+常数分母")
+            
             # 4. 构造两两之比（a/b 和 b/a）
             pair_ratio_candidates = []
             
