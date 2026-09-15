@@ -934,9 +934,64 @@ class ResidualSolver:
             n_prior_atoms=len(prior_trees),
         )
 
-        # R11: Predictor-guided rational search
-        # 在 bootstrap 之前尝试构造有理函数结构
+        # R14: 自适应策略选择
+        r14_decision = None
         if profile == 'multi':
+            from tool.adaptive_strategy import r14_adaptive_strategy_selection, SearchStrategy
+            
+            # 先用数据特征做初始评估（bootstrap MSE 尚不可用）
+            r14_best, r14_fallback, r14_scores = r14_adaptive_strategy_selection(
+                y_obs, 
+                bootstrap_mse=None,
+                verbose=verbose
+            )
+            
+            r14_decision = {
+                "best_strategy": r14_best,
+                "fallback_order": r14_fallback,
+                "scores": r14_scores,
+            }
+            diag["r14_strategy"] = r14_best.value
+            diag["r14_scores"] = {k.value: v for k, v in r14_scores.items()}
+
+        # R13: 高价值模式库匹配（优先于 R11/R12）
+        # R14 决策：如果策略得分过低，跳过 R13
+        _r14_skip_r13 = (r14_decision is not None and
+                         r14_scores.get(SearchStrategy.R13_PATTERN, 0) < 0.15)
+        if profile == 'multi' and not _r14_skip_r13:
+            from tool.pattern_library import r13_pattern_matching
+            
+            r13_var_data = {
+                'x': self.var_data['x'],
+                'y': self.var_data['y'],
+                'y_obs': y_obs
+            }
+            
+            r13_result = r13_pattern_matching(
+                eval_tree, 
+                r13_var_data, 
+                threshold=tol,
+                verbose=verbose
+            )
+            
+            if r13_result is not None:
+                expr_str, mse, weight = r13_result
+                if verbose:
+                    print(f"🎯 R13 直接匹配成功! MSE={mse:.6e}")
+                    print(f"   Expression: {expr_str}")
+                diag["final_mse"] = float(mse)
+                diag["n_active_terms"] = 1
+                diag["r13_direct_match"] = True
+                if record_diagnostics:
+                    self.last_diagnostic = diag
+                return mse, simplify_expression_string(expr_str)
+
+        # R11: Predictor-guided rational search
+        # R14 决策：根据策略评估结果调整 R11/R12 的执行
+        _r14_skip_r11 = (r14_decision is not None and
+                         r14_scores.get(SearchStrategy.R11_RATIONAL, 0) < 0.15 and
+                         r14_scores.get(SearchStrategy.R12_NESTED, 0) < 0.15)
+        if profile == 'multi' and not _r14_skip_r11:
             from tool.rational_mutation import deep_copy_tree
             
             # 1. 构建 composed_trees 候选池
@@ -1201,6 +1256,20 @@ class ResidualSolver:
                 )
             diag["bootstrap_mse"] = float(boot_mse)
             diag["n_bootstrap_terms"] = len(boot_cols)
+            
+            # R14: bootstrap 后更新策略评估
+            if profile == 'multi' and r14_decision is not None:
+                from tool.adaptive_strategy import r14_adaptive_strategy_selection
+                _, r14_fallback_post, r14_scores_post = r14_adaptive_strategy_selection(
+                    y_obs, bootstrap_mse=float(boot_mse), verbose=False
+                )
+                diag["r14_post_bootstrap_strategy"] = r14_fallback_post[0].value
+                diag["r14_post_scores"] = {k.value: v for k, v in r14_scores_post.items()}
+                if verbose:
+                    _post_best = r14_fallback_post[0].value
+                    _post_mse = float(boot_mse)
+                    print(f"📊 R14 bootstrap 后评估: best={_post_best}, bootstrap_mse={_post_mse:.6e}")
+            
             active_patches_y.extend(boot_cols)
             active_trees.extend(boot_entries)
             if boot_cols:
